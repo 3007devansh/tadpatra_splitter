@@ -1,0 +1,9 @@
+Notes:
+1). Source code is written in C++ / MFC (Microsoft Foundation Library) using Visual Studio 2022 Community Edition.
+
+2). It is using OpenCV ver 4.54.
+
+Just download OpenCV from its website and copy it to C:\OpenCV directory.
+
+3). Source code is referring .h and .lib files from C:\OpenCV location.
+
