@@ -26,8 +26,43 @@ from PIL import Image, ImageTk
 # ---------------------------------------------------------------------------
 
 APP_VERSION = "2.0.0.0"
-MIN_BORDER_PIXEL_MARGIN = 0
-MAX_BORDER_PIXEL_MARGIN = 150
+MIN_BORDER_MM = 0
+MAX_BORDER_MM = 50
+DEFAULT_BORDER_MM = 2
+DEFAULT_DPI = 300
+DPI_OPTIONS = [100, 150, 200, 300, 400, 600]
+
+
+def _mm_to_px(mm: float, dpi: int) -> int:
+    """Convert millimetres to pixels at the given scan DPI."""
+    return max(0, int(round(mm * dpi / 25.4)))
+
+
+def _add_white_border(img, border_px: int):
+    """Add a uniform white border of border_px pixels on all four sides."""
+    if border_px <= 0:
+        return img
+    return cv2.copyMakeBorder(
+        img, border_px, border_px, border_px, border_px,
+        cv2.BORDER_CONSTANT, value=(255, 255, 255),
+    )
+
+
+def _trim_white(img, threshold: int = 250):
+    """
+    Crop away all white (or near-white) border on all four sides.
+    threshold: pixels with all channels >= this value are considered white.
+    Uses 250 instead of 255 to absorb JPEG / interpolation fringe pixels.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask = gray < threshold          # True where there is actual content
+    if not mask.any():
+        return img                   # image is entirely white — return as-is
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    r0, r1 = int(rows[0]), int(rows[-1])
+    c0, c1 = int(cols[0]), int(cols[-1])
+    return img[r0:r1 + 1, c0:c1 + 1]
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +175,10 @@ def _is_broken(details) -> bool:
     )
 
 
-def _extract_strip(img, detail: dict, contours, border: int):
+def _extract_strip(img, detail: dict, contours):
     """
     Extract a single Tadpatra strip with convex-hull masking (white background
-    outside the hull) and add a white border of `border` pixels on all sides.
+    outside the hull).
 
     Replicates the convexHull / drawContours / bitwise_or logic from
     CBatchProcessingDlg::ImageSplittingThreadFunc() exactly.
@@ -173,15 +208,7 @@ def _extract_strip(img, detail: dict, contours, border: int):
 
     # OR with 3-channel mask → pixels outside hull become white
     mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    result = cv2.bitwise_or(crop, mask3)
-
-    # Add white border
-    return cv2.copyMakeBorder(
-        result,
-        border, border, border, border,
-        cv2.BORDER_CONSTANT,
-        value=(255, 255, 255),
-    )
+    return cv2.bitwise_or(crop, mask3)
 
 
 def _deskew_image(img, angle_range: float = 10.0, angle_step: float = 0.5):
@@ -260,7 +287,8 @@ def _split_and_save(
     manuscript: str,
     tile_num: int,
     front_side: bool,
-    border: int,
+    border_mm: float,
+    dpi: int,
     do_deskew: bool,
     overwrite_cb=None,
 ) -> None:
@@ -293,6 +321,7 @@ def _split_and_save(
 
     details, contours = _detect_strips(img)
     n = len(details)
+    border_px = _mm_to_px(border_mm, dpi)
 
     def _can_write(out_path: str) -> bool:
         if not os.path.exists(out_path):
@@ -309,10 +338,15 @@ def _split_and_save(
         # Valid multi-strip image → extract each strip with hull masking
         n_rem = n
         for i, od in enumerate(details):
-            stripped = _extract_strip(img, od, contours, border)
+            stripped = _extract_strip(img, od, contours)
 
             if do_deskew:
                 stripped = _deskew_image(stripped)
+
+            # Remove any white canvas introduced by rotation, then add
+            # a strict uniform margin so the final border is exactly border_px.
+            stripped = _trim_white(stripped)
+            stripped = _add_white_border(stripped, border_px)
 
             if front_side:
                 strip_num = i + 1        # A: 1, 2, 3, …
@@ -380,13 +414,21 @@ class BatchProcessingTab(ttk.Frame):
         ).grid(row=r, column=1, sticky="w", pady=(8, 0))
 
         r += 1
-        ttk.Label(lf, text="Output Border Pixel Margin:").grid(
+        ttk.Label(lf, text="Scan DPI:").grid(row=r, column=0, sticky="w", pady=(8, 0))
+        self._v_dpi = tk.StringVar(value=str(DEFAULT_DPI))
+        ttk.Combobox(
+            lf, textvariable=self._v_dpi,
+            values=[str(d) for d in DPI_OPTIONS], state="readonly", width=10,
+        ).grid(row=r, column=1, sticky="w", pady=(8, 0))
+
+        r += 1
+        ttk.Label(lf, text="Output Border Margin (mm):").grid(
             row=r, column=0, sticky="w", pady=(8, 0)
         )
-        self._v_border = tk.IntVar(value=100)
+        self._v_border = tk.IntVar(value=DEFAULT_BORDER_MM)
         ttk.Spinbox(
             lf, textvariable=self._v_border,
-            from_=MIN_BORDER_PIXEL_MARGIN, to=MAX_BORDER_PIXEL_MARGIN, width=8,
+            from_=MIN_BORDER_MM, to=MAX_BORDER_MM, width=8,
         ).grid(row=r, column=1, sticky="w", pady=(8, 0))
 
         r += 1
@@ -490,11 +532,11 @@ class BatchProcessingTab(ttk.Frame):
             return
 
         b = self._v_border.get()
-        if not (MIN_BORDER_PIXEL_MARGIN <= b <= MAX_BORDER_PIXEL_MARGIN):
+        if not (MIN_BORDER_MM <= b <= MAX_BORDER_MM):
             messagebox.showerror(
                 "TadpatraSplitter",
-                f"Border margin must be between {MIN_BORDER_PIXEL_MARGIN} "
-                f"and {MAX_BORDER_PIXEL_MARGIN}.",
+                f"Border margin must be between {MIN_BORDER_MM} "
+                f"and {MAX_BORDER_MM} mm.",
             )
             return
 
@@ -536,7 +578,8 @@ class BatchProcessingTab(ttk.Frame):
             inp = self._v_input.get().strip()
             out = self._v_output.get().strip()
             ext = self._v_imgtype.get()            # "JPG" or "PNG"
-            border = self._v_border.get()
+            border_mm = self._v_border.get()
+            dpi = int(self._v_dpi.get())
             first_is_title = self._v_title.get()
 
             os.makedirs(out, exist_ok=True)
@@ -599,7 +642,7 @@ class BatchProcessingTab(ttk.Frame):
                 # ---- Strip detection + save (shared logic) ---------------
                 _split_and_save(
                     img, fpath, out, manuscript, tile_num, front_side,
-                    border, self._v_deskew.get(),
+                    border_mm, dpi, self._v_deskew.get(),
                 )
 
                 front_side = not front_side
@@ -685,13 +728,21 @@ class ManualProcessingTab(ttk.Frame):
         )
 
         r += 1
-        ttk.Label(lf, text="Output Border Pixel Margin:").grid(
+        ttk.Label(lf, text="Scan DPI:").grid(row=r, column=0, sticky="w", pady=(8, 0))
+        self._v_dpi = tk.StringVar(value=str(DEFAULT_DPI))
+        ttk.Combobox(
+            lf, textvariable=self._v_dpi,
+            values=[str(d) for d in DPI_OPTIONS], state="readonly", width=10,
+        ).grid(row=r, column=1, sticky="w", pady=(8, 0))
+
+        r += 1
+        ttk.Label(lf, text="Output Border Margin (mm):").grid(
             row=r, column=0, sticky="w", pady=(8, 0)
         )
-        self._v_border = tk.IntVar(value=100)
+        self._v_border = tk.IntVar(value=DEFAULT_BORDER_MM)
         ttk.Spinbox(
             lf, textvariable=self._v_border,
-            from_=MIN_BORDER_PIXEL_MARGIN, to=MAX_BORDER_PIXEL_MARGIN, width=8,
+            from_=MIN_BORDER_MM, to=MAX_BORDER_MM, width=8,
         ).grid(row=r, column=1, sticky="w", pady=(8, 0))
 
         r += 1
@@ -824,7 +875,8 @@ class ManualProcessingTab(ttk.Frame):
 
         try:
             os.makedirs(out, exist_ok=True)
-            border = self._v_border.get()
+            border_mm = self._v_border.get()
+            dpi = int(self._v_dpi.get())
             do_deskew = self._v_deskew.get()
 
             # Ask-before-overwrite callback used instead of silent overwrite
@@ -850,7 +902,8 @@ class ManualProcessingTab(ttk.Frame):
                     manuscript=msnum,
                     tile_num=1,
                     front_side=front_side,
-                    border=border,
+                    border_mm=border_mm,
+                    dpi=dpi,
                     do_deskew=do_deskew,
                     overwrite_cb=_ask,
                 )
